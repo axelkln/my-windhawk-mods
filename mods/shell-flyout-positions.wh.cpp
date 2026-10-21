@@ -1,7 +1,7 @@
 // ==WindhawkMod==
 // @id              shell-flyout-positions
 // @name            Shell Flyout Positions
-// @description     Customize the position of the Notification Center, Action Center, and Start menu on Windows 11
+// @description     Customize the position of the Notification Center, Action Center, input switcher, and Start menu on Windows 11
 // @version         1.3
 // @author          m417z
 // @github          https://github.com/m417z
@@ -28,7 +28,7 @@
 # Shell Flyout Positions
 
 Customize the position of the Notification Center (Win+N), Action Center
-(Win+A), and Start menu on Windows 11.
+(Win+A), keyboard language input switcher, and Start menu on Windows 11.
 
 ## Notification Center and Action Center
 
@@ -48,6 +48,12 @@ For the necessary configuration, see [this comment on
 GitHub](https://github.com/ramensoftware/windhawk-mods/issues/1053#issuecomment-2405461863).
 
 ![Screenshot](https://i.imgur.com/ezxArY1.png)
+
+## Input switcher
+
+The keyboard language input switcher can be repositioned horizontally using
+alignment and pixel shift settings. Windows default alignment with a shift of
+zero leaves its position unchanged.
 
 ## Start menu
 
@@ -94,6 +100,21 @@ shift options allow fine-tuning in both directions.
       A positive value moves the element to the right, a negative value moves it
       to the left
   $name: Action Center
+- inputSwitcher:
+  - horizontalAlignment: windowsDefault
+    $name: Horizontal alignment
+    $options:
+    - windowsDefault: Windows default
+    - right: Right
+    - center: Center
+    - left: Left
+    - tray: Aligned to tray area
+  - horizontalShift: 0
+    $name: Horizontal shift
+    $description: >-
+      A positive value moves the element to the right, a negative value moves it
+      to the left
+  $name: Input switcher
 - startMenu:
   - horizontalAlignment: windowsDefault
     $name: Horizontal alignment
@@ -150,6 +171,8 @@ shift options allow fine-tuning in both directions.
 #include <functional>
 #include <future>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -196,6 +219,7 @@ struct StartMenuSettings {
 struct {
     TrayElementSettings notificationCenter;
     TrayElementSettings actionCenter;
+    TrayElementSettings inputSwitcher;
     StartMenuSettings startMenu;
 } g_settings;
 
@@ -1950,6 +1974,203 @@ BOOL WINAPI SetWindowPos_Hook(HWND hWnd,
 
 }  // namespace CoreWindowUI
 
+namespace InputSwitcherUI {
+
+using SetWindowPos_t = decltype(&SetWindowPos);
+SetWindowPos_t SetWindowPos_Original;
+
+struct WindowPosition {
+    int originalX;
+    int customX;
+    int y;
+    HMONITOR monitor;
+};
+
+std::mutex g_positionsMutex;
+std::map<HWND, WindowPosition> g_positions;
+constexpr WCHAR kPositionProperty[] =
+    L"Windhawk_InputSwitcherPosition_" WH_MOD_ID;
+
+bool IsInputSwitcher(HWND hWnd) {
+    DWORD processId = 0;
+    if (!hWnd || !GetWindowThreadProcessId(hWnd, &processId) ||
+        processId != GetCurrentProcessId() ||
+        GetAncestor(hWnd, GA_ROOT) != hWnd ||
+        (GetWindowLongPtr(hWnd, GWL_STYLE) & WS_CHILD)) {
+        return false;
+    }
+
+    WCHAR className[64];
+    return GetClassName(hWnd, className, ARRAYSIZE(className)) &&
+           _wcsicmp(className, L"Shell_InputSwitchTopLevelWindow") == 0;
+}
+
+bool IsDefault() {
+    return g_settings.inputSwitcher.horizontalAlignment ==
+               TrayHorizontalAlignment::windowsDefault &&
+           g_settings.inputSwitcher.horizontalShift == 0;
+}
+
+BOOL WINAPI SetWindowPos_Hook(HWND hWnd,
+                              HWND hWndInsertAfter,
+                              int X,
+                              int Y,
+                              int cx,
+                              int cy,
+                              UINT uFlags) {
+    auto original = [=]() {
+        return SetWindowPos_Original(hWnd, hWndInsertAfter, X, Y, cx, cy,
+                                     uFlags);
+    };
+
+    if (!IsInputSwitcher(hWnd) || (uFlags & SWP_HIDEWINDOW) ||
+        (uFlags & (SWP_NOMOVE | SWP_NOSIZE)) == (SWP_NOMOVE | SWP_NOSIZE)) {
+        return original();
+    }
+
+    std::optional<WindowPosition> previous;
+    {
+        std::lock_guard lock(g_positionsMutex);
+        auto it = g_positions.find(hWnd);
+        if (it != g_positions.end()) {
+            // Window properties disappear on destruction, unlike an HWND cache.
+            if (GetProp(hWnd, kPositionProperty) == &g_positions) {
+                previous = it->second;
+            } else {
+                g_positions.erase(it);
+            }
+        }
+    }
+
+    bool restore = g_unloading || IsDefault();
+    if (restore && !previous) {
+        return original();
+    }
+
+    RECT rc;
+    if (!GetWindowRect(hWnd, &rc)) {
+        return original();
+    }
+
+    int x = (uFlags & SWP_NOMOVE) ? rc.left : X;
+    int y = (uFlags & SWP_NOMOVE) ? rc.top : Y;
+    int width = (uFlags & SWP_NOSIZE) ? rc.right - rc.left : cx;
+    int height = (uFlags & SWP_NOSIZE) ? rc.bottom - rc.top : cy;
+    if (width <= 0 || height <= 0) {
+        return original();
+    }
+
+    RECT proposed{x, y, x + width, y + height};
+    HMONITOR monitor = MonitorFromRect(&proposed, MONITOR_DEFAULTTONEAREST);
+    int originalX = x;
+    if (previous && x == previous->customX &&
+        (monitor == previous->monitor || y == previous->y)) {
+        // Windows can reuse the adjusted position, including for size-only
+        // calls.
+        originalX = previous->originalX;
+        monitor = previous->monitor;
+    }
+
+    MONITORINFO monitorInfo{sizeof(monitorInfo)};
+    if (!GetMonitorInfo(monitor, &monitorInfo)) {
+        return original();
+    }
+
+    int xNew = originalX;
+    if (!restore) {
+        if (g_settings.inputSwitcher.horizontalAlignment ==
+            TrayHorizontalAlignment::windowsDefault) {
+            UINT monitorDpiX = 96;
+            UINT monitorDpiY = 96;
+            GetDpiForMonitor(monitor, MDT_DEFAULT, &monitorDpiX, &monitorDpiY);
+            xNew += MulDiv(g_settings.inputSwitcher.horizontalShift,
+                           monitorDpiX, 96);
+        } else {
+            xNew = CalculateAlignedXForMonitor(monitor, monitorInfo, width,
+                                               g_settings.inputSwitcher);
+        }
+
+        if (!SetProp(hWnd, kPositionProperty, &g_positions)) {
+            return original();
+        }
+    }
+
+    Wh_Log(L"Adjusting input switcher: %d -> %d", x, xNew);
+
+    // A resize can require movement to preserve the selected alignment.
+    if (xNew != x) {
+        X = xNew;
+        Y = y;
+        uFlags &= ~SWP_NOMOVE;
+    }
+
+    BOOL result =
+        SetWindowPos_Original(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags);
+    DWORD error = GetLastError();
+    if (result) {
+        std::lock_guard lock(g_positionsMutex);
+        if (restore) {
+            g_positions.erase(hWnd);
+            RemoveProp(hWnd, kPositionProperty);
+        } else {
+            g_positions[hWnd] = {originalX, xNew, y, monitor};
+        }
+    } else if (!previous) {
+        RemoveProp(hWnd, kPositionProperty);
+    }
+
+    SetLastError(error);
+    return result;
+}
+
+void ApplySettings() {
+    // FindWindowEx also includes the shell's banded top-level windows.
+    HWND hWnd = nullptr;
+    while ((hWnd = FindWindowEx(nullptr, hWnd,
+                                L"Shell_InputSwitchTopLevelWindow", nullptr))) {
+        if (!IsInputSwitcher(hWnd)) {
+            continue;
+        }
+
+        RunFromWindowThread(
+            hWnd,
+            [](PVOID param) {
+                HWND hWnd = static_cast<HWND>(param);
+                if (!IsInputSwitcher(hWnd)) {
+                    return;
+                }
+                RECT rc;
+                if (GetWindowRect(hWnd, &rc)) {
+                    SetWindowPos_Hook(
+                        hWnd, nullptr, rc.left, rc.top, 0, 0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+            },
+            hWnd);
+    }
+
+    std::lock_guard lock(g_positionsMutex);
+    for (auto it = g_positions.begin(); it != g_positions.end();) {
+        if (GetProp(it->first, kPositionProperty) != &g_positions) {
+            it = g_positions.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void Uninit() {
+    std::lock_guard lock(g_positionsMutex);
+    for (const auto& [hWnd, position] : g_positions) {
+        if (GetProp(hWnd, kPositionProperty) == &g_positions) {
+            RemoveProp(hWnd, kPositionProperty);
+        }
+    }
+    g_positions.clear();
+}
+
+}  // namespace InputSwitcherUI
+
 void LoadSettings() {
     // Notification center settings.
     PCWSTR notificationCenterHorizontalAlignment =
@@ -2001,6 +2222,29 @@ void LoadSettings() {
             Wh_GetIntSetting(L"actionCenter.horizontalShift");
     }
     Wh_FreeStringSetting(actionCenterHorizontalAlignment);
+
+    // Input switcher settings.
+    PCWSTR inputSwitcherHorizontalAlignment =
+        Wh_GetStringSetting(L"inputSwitcher.horizontalAlignment");
+    g_settings.inputSwitcher.horizontalAlignment =
+        TrayHorizontalAlignment::windowsDefault;
+    if (wcscmp(inputSwitcherHorizontalAlignment, L"right") == 0) {
+        g_settings.inputSwitcher.horizontalAlignment =
+            TrayHorizontalAlignment::right;
+    } else if (wcscmp(inputSwitcherHorizontalAlignment, L"center") == 0) {
+        g_settings.inputSwitcher.horizontalAlignment =
+            TrayHorizontalAlignment::center;
+    } else if (wcscmp(inputSwitcherHorizontalAlignment, L"left") == 0) {
+        g_settings.inputSwitcher.horizontalAlignment =
+            TrayHorizontalAlignment::left;
+    } else if (wcscmp(inputSwitcherHorizontalAlignment, L"tray") == 0) {
+        g_settings.inputSwitcher.horizontalAlignment =
+            TrayHorizontalAlignment::tray;
+    }
+    Wh_FreeStringSetting(inputSwitcherHorizontalAlignment);
+
+    g_settings.inputSwitcher.horizontalShift =
+        Wh_GetIntSetting(L"inputSwitcher.horizontalShift");
 
     // Start menu settings.
     PCWSTR startMenuHorizontalAlignment =
@@ -2074,9 +2318,10 @@ bool NeedsToBeLoaded() {
     switch (g_target) {
         case Target::Explorer:
             // The search menu is aligned to the start menu and the notification
-            // center flyout is positioned from this process.
+            // center and input switcher flyouts are positioned from this process.
             return startMenuNeedsAdjustment ||
-                   notificationCenterNeedsAdjustment;
+                   notificationCenterNeedsAdjustment ||
+                   !InputSwitcherUI::IsDefault();
 
         case Target::StartMenuExperienceHost:
             return startMenuNeedsAdjustment;
@@ -2150,6 +2395,12 @@ BOOL Wh_ModInit() {
         return TRUE;
     }
 
+    if (!WindhawkUtils::SetFunctionHook(
+            SetWindowPos, InputSwitcherUI::SetWindowPos_Hook,
+            &InputSwitcherUI::SetWindowPos_Original)) {
+        return FALSE;
+    }
+
     HMODULE dwmapiModule =
         LoadLibraryEx(L"dwmapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (dwmapiModule) {
@@ -2169,7 +2420,9 @@ BOOL Wh_ModInit() {
 void Wh_ModAfterInit() {
     Wh_Log(L">");
 
-    if (g_target == Target::StartMenuExperienceHost) {
+    if (g_target == Target::Explorer) {
+        InputSwitcherUI::ApplySettings();
+    } else if (g_target == Target::StartMenuExperienceHost) {
         HWND hCoreWnd = StartMenuUI::GetCoreWnd();
         if (hCoreWnd) {
             Wh_Log(L"Initializing - Found core window");
@@ -2188,6 +2441,7 @@ void Wh_ModBeforeUninit() {
     g_unloading = true;
 
     if (g_target == Target::Explorer) {
+        InputSwitcherUI::ApplySettings();
         RestoreNotificationCenterToDefault();
         RestoreSearchMenuToDefault();
     } else if (g_target == Target::StartMenuExperienceHost) {
@@ -2205,12 +2459,20 @@ void Wh_ModBeforeUninit() {
 
 void Wh_ModUninit() {
     Wh_Log(L">");
+
+    if (g_target == Target::Explorer) {
+        InputSwitcherUI::Uninit();
+    }
 }
 
 BOOL Wh_ModSettingsChanged(BOOL* bReload) {
     Wh_Log(L">");
 
     LoadSettings();
+
+    if (g_target == Target::Explorer) {
+        InputSwitcherUI::ApplySettings();
+    }
 
     if (!NeedsToBeLoaded()) {
         Wh_Log(L"No need to be loaded due to settings");
